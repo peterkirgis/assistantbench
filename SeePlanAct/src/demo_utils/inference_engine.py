@@ -17,12 +17,11 @@ import time
 
 import backoff
 import openai
-from openai.error import (
+from openai import (
     APIConnectionError,
     APIError,
     RateLimitError,
-    ServiceUnavailableError,
-    InvalidRequestError
+    OpenAI
 )
 
 import base64
@@ -56,8 +55,9 @@ class OpenaiEngine(Engine):
             api_key=None,
             stop=["\n\n"],
             rate_limit=-1,
-            model=None,
+            model_name=None,
             temperature=0,
+            client_init_kwargs: dict = None,
             **kwargs,
     ) -> None:
         """Init an OpenAI GPT/Codex engine
@@ -81,7 +81,11 @@ class OpenaiEngine(Engine):
             raise ValueError("api_key must be a string or list")
         self.stop = stop
         self.temperature = temperature
-        self.model = model
+        if model_name is None:
+            model_name = kwargs.pop("model", None)
+        self.model_name = model_name
+        self.client_init_kwargs = client_init_kwargs
+
         # convert rate limit to minmum request interval
         self.request_interval = 0 if rate_limit == -1 else 60.0 / rate_limit
         self.next_avil_time = [0] * len(self.api_keys)
@@ -94,9 +98,9 @@ class OpenaiEngine(Engine):
 
     @backoff.on_exception(
         backoff.expo,
-        (APIError, RateLimitError, APIConnectionError, ServiceUnavailableError, InvalidRequestError),
+        (APIError, RateLimitError, APIConnectionError),
     )
-    def generate(self, prompt: list = None, max_new_tokens=4096, temperature=None, model=None, image_path=None,
+    def generate(self, prompt: list = None, max_new_tokens=4096, temperature=None, model_name=None, image_path=None,
                  ouput__0=None, turn_number=0, **kwargs):
         self.current_key_idx = (self.current_key_idx + 1) % len(self.api_keys)
         start_time = time.time()
@@ -110,9 +114,11 @@ class OpenaiEngine(Engine):
         prompt1 = prompt[1]
         prompt2 = prompt[2]
 
+        current_model = model_name if model_name is not None else self.model_name
+
         if turn_number == 0:
             # Assume one turn dialogue
-            if self.model != "claude":
+            if current_model != "claude":
                 base64_image = encode_image(image_path)
                 prompt1_input = [
                     {"role": "system", "content": [{"type": "text", "text": prompt0}]},
@@ -122,14 +128,16 @@ class OpenaiEngine(Engine):
                                                                                                         "detail": "high"},
                                                                      }]},
                 ]
-                response1 = openai.ChatCompletion.create(
-                    model=model if model else self.model,
+                client = OpenAI(**(self.client_init_kwargs if self.client_init_kwargs is not None else {}))
+                response1 = client.chat.completions.create(
+                    model=current_model,
                     messages=prompt1_input,
                     max_tokens=max_new_tokens if max_new_tokens else 4096,
                     temperature=temperature if temperature else self.temperature,
                     **kwargs,
                 )
-                answer1 = [choice["message"]["content"] for choice in response1["choices"]][0]
+                answer1 = response1.choices[0].message.content
+                
             else:
                 bits_image = claude_encode_image(image_path)
                 prompt1_input = [
@@ -146,7 +154,7 @@ class OpenaiEngine(Engine):
 
             return answer1
         elif turn_number == 1:
-            if self.model != "claude":
+            if current_model != "claude":
                 base64_image = encode_image(image_path)
                 prompt2_input = [
                     {"role": "system", "content": [{"type": "text", "text": prompt0}]},
@@ -156,14 +164,15 @@ class OpenaiEngine(Engine):
                                                                                                         "detail": "high"}, }]},
                     {"role": "assistant", "content": [{"type": "text", "text": f"\n\n{ouput__0}"}]},
                     {"role": "user", "content": [{"type": "text", "text": prompt2}]}, ]
-                response2 = openai.ChatCompletion.create(
-                    model=model if model else self.model,
+                client = OpenAI(**(self.client_init_kwargs if self.client_init_kwargs is not None else {}))
+                response2 = client.chat.completions.create(
+                    model=current_model,
                     messages=prompt2_input,
                     max_tokens=max_new_tokens if max_new_tokens else 4096,
                     temperature=temperature if temperature else self.temperature,
                     **kwargs,
                 )
-                answer2 = [choice["message"]["content"] for choice in response2["choices"]][0]
+                answer2 = response2.choices[0].message.content
             else:
                 bits_image = claude_encode_image(image_path)
                 prompt2_input = [
@@ -178,8 +187,7 @@ class OpenaiEngine(Engine):
                     system=[{'text': prompt0}],
                     inferenceConfig={"temperature": self.temperature, "topP": 1.0, "maxTokens": max_new_tokens if max_new_tokens else 4096},
                 )
-                answer2 = response2["output"]["message"]["content"][0]["text"] if len(response2["output"]["message"]["content"]) > 0 else ""
-
+                answer2 = response2.choices[0].message.content
             return answer2
 
 
@@ -189,7 +197,7 @@ class OpenaiEngine_MindAct(Engine):
             api_key=None,
             stop=["\n\n"],
             rate_limit=-1,
-            model=None,
+            model_name=None,
             temperature=0,
             **kwargs,
     ) -> None:
@@ -214,7 +222,7 @@ class OpenaiEngine_MindAct(Engine):
             raise ValueError("api_key must be a string or list")
         self.stop = stop
         self.temperature = temperature
-        self.model = model
+        self.model_name = model_name
         # convert rate limit to minmum request interval
         self.request_interval = 0 if rate_limit == -1 else 60.0 / rate_limit
         self.next_avil_time = [0] * len(self.api_keys)
@@ -223,7 +231,7 @@ class OpenaiEngine_MindAct(Engine):
 
     @backoff.on_exception(
         backoff.expo,
-        (APIError, RateLimitError, APIConnectionError, ServiceUnavailableError),
+        (APIError, RateLimitError, APIConnectionError),
     )
     def generate(self, prompt, max_new_tokens=50, temperature=0, model=None, **kwargs):
         self.current_key_idx = (self.current_key_idx + 1) % len(self.api_keys)
@@ -239,8 +247,9 @@ class OpenaiEngine_MindAct(Engine):
             prompt = [
                 {"role": "user", "content": prompt},
             ]
-        response = openai.ChatCompletion.create(
-            model=model if model else self.model,
+        client = OpenAI()
+        response = client.chat.completions.create(
+            model=model if model else self.model_name,
             messages=prompt,
             max_tokens=max_new_tokens,
             temperature=temperature,

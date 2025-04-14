@@ -1,0 +1,5 @@
+aioconsole==0.7.1
+toml==0.10.2
+torch==2.2.2
+boto3==1.34.149
+sentence-transformers==2.7.0

@@ -33,23 +33,23 @@ import torch
 from aioconsole import ainput, aprint
 from playwright.async_api import async_playwright
 
-from data_utils.format_prompt_utils import get_index_from_option_name
-from data_utils.prompts import generate_prompt, format_options
-from demo_utils.browser_helper import (
+from .data_utils.format_prompt_utils import get_index_from_option_name
+from .data_utils.prompts import generate_prompt, format_options
+from .demo_utils.browser_helper import (
     normal_launch_async,
     normal_new_context_async,
     get_interactive_elements_with_playwright,
     select_option,
     saveconfig,
 )
-from demo_utils.format_prompt import (
+from .demo_utils.format_prompt import (
     format_choices,
     format_ranking_input,
     postprocess_action_lmm,
 )
-from demo_utils.inference_engine import OpenaiEngine
-from demo_utils.ranking_model import CrossEncoder, find_topk
-from demo_utils.website_dict import website_dict
+from .demo_utils.inference_engine import OpenaiEngine
+from .demo_utils.ranking_model import CrossEncoder, find_topk
+from .demo_utils.website_dict import website_dict
 
 # Remove Huggingface internal warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -110,8 +110,30 @@ async def page_on_open_handler(page):
     page.on("crash", page_on_crash_handler)
     session_control.active_page = page
 
+def load_config(config_path: str) -> dict:
+    """Load and return the configuration from a TOML file."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    full_path = (
+        os.path.join(base_dir, config_path)
+        if not os.path.isabs(config_path)
+        else config_path
+    )
+    try:
+        with open(full_path, "r", encoding="utf-8") as file:
+            config = toml.load(file)
+            print(f"Configuration loaded from {full_path}")
+            return config
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Error: File '{full_path}' not found.")
+    except toml.TomlDecodeError:
+        raise ValueError(f"Error: File '{full_path}' is not a valid TOML file.")
 
-async def main(config, base_dir) -> None:
+
+async def run_tasks(config, base_dir, model_name, client_init_kwargs) -> None:
+
+    final_answer = ""
+    results = {}
+
     # basic settings
     is_demo = config["basic"]["is_demo"]
     ranker_path = None
@@ -141,8 +163,8 @@ async def main(config, base_dir) -> None:
     top_k = config["experiment"]["top_k"]
     fixed_choice_batch_size = config["experiment"]["fixed_choice_batch_size"]
     dynamic_choice_batch_size = config["experiment"]["dynamic_choice_batch_size"]
-    max_continuous_no_op = 3
-    max_op = 30
+    max_continuous_no_op = 5
+    max_op = 50
     highlight = config["experiment"]["highlight"]
     monitor = config["experiment"]["monitor"]
     dev_mode = config["experiment"]["dev_mode"]
@@ -177,10 +199,12 @@ async def main(config, base_dir) -> None:
     trace_snapshots = config["playwright"]["trace"]["snapshots"]
     trace_sources = config["playwright"]["trace"]["sources"]
 
-    # Initialize Inference Engine based on OpenAI API
-    generation_model = OpenaiEngine(
-        **openai_config,
-    )
+    # Adjust script to add model_name as a parameter
+    if model_name:
+        generation_model = OpenaiEngine(model_name=model_name, client_init_kwargs=client_init_kwargs, **openai_config)
+    else:
+        # Fallback to the default instantiation if no model_name provided.
+        generation_model = OpenaiEngine(**openai_config)
 
     # Load ranking model for prune candidate elements
     ranking_model = None
@@ -627,10 +651,14 @@ async def main(config, base_dir) -> None:
                     if dev_mode:
                         for prompt_i in prompt:
                             logger.info(prompt_i)
+                
 
                     output0 = generation_model.generate(
                         prompt=prompt, image_path=input_image_path, turn_number=0
                     )
+
+                    print(output0)
+
                     openai_call['input'].append(prompt[0] + prompt[1])
                     openai_call['image'].append(1)
                     openai_call['output'].append(output0)
@@ -727,6 +755,13 @@ async def main(config, base_dir) -> None:
                     pred_element, pred_action, pred_value = postprocess_action_lmm(
                         output
                     )
+                    if "Terminating" in output0:
+                        # Optionally, you can log or print a debug message here.
+                        print("DEBUG: Final answer detected in output; triggering termination.")
+                        pred_element, pred_action, pred_value = ("", "TERMINATE", "")
+                    print("###################")
+                    print(output0)
+                    print("###################")
                     if len(pred_element) in [1, 2]:
                         element_id = get_index_from_option_name(pred_element)
                     else:
@@ -1341,9 +1376,27 @@ async def main(config, base_dir) -> None:
                     logger.info(
                         f"Write results to json file: {os.path.join(main_result_path, 'result.json')}"
                     )
+
+                    final_answer = ""
+
+                    # only keep text after "Task answer: \n" for refined_plan
+                    if "Task answer" in refined_plan:
+                        refined_plan = refined_plan.split("Task answer:")[-1]
+                        # remove ### from the end of the answer
+                        refined_plan = refined_plan.split("###")[0]
+
+                        # remove Terminating, the task has been completed.
+                        if "Terminating" in refined_plan:
+                            refined_plan = refined_plan.split("Terminating")[0]
+
+                    
+                        # remove any leading white space or new line characters
+                        final_answer = refined_plan.strip()
+
                     final_json = {
                         "confirmed_task": confirmed_task,
                         "website": confirmed_website,
+                        "final answer": final_answer,
                         "task_id": task_id,
                         "success_or_not": success_or_not,
                         "num_step": len(taken_actions),
@@ -1357,6 +1410,8 @@ async def main(config, base_dir) -> None:
                         encoding="utf-8",
                     ) as file:
                         json.dump(final_json, file, indent=4)
+
+                    results[task_id] = refined_plan 
 
                     if monitor:
                         logger.info(
@@ -1373,39 +1428,20 @@ async def main(config, base_dir) -> None:
 
                     complete_flag = True
 
+    return final_answer
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
 
-    parser.add_argument(
-        "-c",
-        "--config_path",
-        help="Path to the TOML configuration file.",
-        type=str,
-        metavar="config",
-        default=f"{os.path.join('config', 'demo_mode.toml')}",
-    )
-    args = parser.parse_args()
 
-    # Load configuration file
+def run_agent_sync(config_path: str, model_name: str, config_override: dict = None, client_init_kwargs: dict = None) -> dict:
+    """
+    Synchronous interface to run the agent.
+    Optionally override parts of the configuration.
+    """
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    config = None
-    try:
-        with open(
-            (
-                os.path.join(base_dir, args.config_path)
-                if not os.path.isabs(args.config_path)
-                else args.config_path
-            ),
-            "r",
-        ) as toml_config_file:
-            config = toml.load(toml_config_file)
-            print(
-                f"Configuration File Loaded - {os.path.join(base_dir, args.config_path)}"
-            )
-    except FileNotFoundError:
-        print(f"Error: File '{args.config_path}' not found.")
-    except toml.TomlDecodeError:
-        print(f"Error: File '{args.config_path}' is not a valid TOML file.")
+    config = load_config(config_path)
+    if config_override:
+        # For example, update the default task if provided.
+        config["basic"].update(config_override)
+    result = asyncio.run(run_tasks(config, base_dir, model_name, client_init_kwargs))
+    return result
 
-    asyncio.run(main(config, base_dir))

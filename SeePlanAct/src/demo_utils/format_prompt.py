@@ -194,6 +194,10 @@ def postprocess_action_llm(text):
 
 
 def postprocess_action_lmm(text):
+    if "Task Answer" in text:
+        # Optionally, you can log or print a debug message here.
+        print("DEBUG: Final answer detected in output; triggering termination.")
+        return ("", "TERMINATE", "")
     text = text.strip()
     text = text.replace(
         "The uppercase letter of your choice. Choose one of the following elements if it matches the target element based on your analysis:\n\n",
